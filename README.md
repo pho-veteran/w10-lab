@@ -1,153 +1,622 @@
-# W10 Lab: Secure & Operate
-
-`w10-lab` là lab demo end-to-end của **Tuần 10**, chủ đề **Secure & Operate**. Nối tiếp
-W8 (foundation) và W9 (delivery), tuần này tập trung hardening ở cluster level: chặn vi
-phạm ngay tại admission thay vì "tin developer hứa". Cuối tuần, repo dựng lại được một mini
-platform end-to-end (GitOps + observability + canary + security) trên fresh cluster trong
-dưới 2h, sẵn sàng cho capstone W11-W12.
-
-> Đây là dự án W9 đã rename sang W10. Nó tái dùng toàn bộ nền tảng tuần 9 (minikube trên
-> EC2, ArgoCD App-of-Apps, canary, observability) và bồi thêm lớp bảo mật, vận hành của
-> tuần 10.
-
-## Mục tiêu cuối tuần
-
-- 3 RBAC role rõ ràng: `developer`, `sre`, `viewer`.
-- 4 Gatekeeper constraint enforce ở namespace `demo`.
-- ESO rotate secret trong dưới 60s, không cần restart pod.
-- Admission từ chối image chưa ký (Cosign + Kyverno verifyImages).
-- Resource guardrails (Quota/LimitRange/QoS), NetworkPolicy, runbook, Cost Guard.
-
-## Lịch tuần (15-19/06/2026)
-
-| Ngày | Nội dung | Trạng thái |
-|---|---|---|
-| **T2 15/06** | D1: RBAC + Admission Policy (OPA/Gatekeeper) | ✅ Đã tích hợp |
-| **T3 16/06** | D2: Secrets Rotation (ESO) + Supply Chain (Trivy/Cosign/Kyverno) | 📋 Kế hoạch |
-| **T4 17/06** | D3: Platform Integration + Runbook + Cost Guard; Live AWS Security; Test 1 | 📋 Kế hoạch |
-| **T5 18/06** | Onsite: Lab "6-risk cluster cleanup + cluster-level enforcement" (full day) | 📋 Kế hoạch |
-| **T6 19/06** | Onsite: hoàn thiện Lab, show-and-tell, Test 2 | 📋 Kế hoạch |
+# Evidence README
 
 ---
 
-## Bối cảnh dự án
+## 1. RBAC + Gatekeeper
 
-- **Cluster:** minikube trên 1 EC2 host (dựng bằng Terraform `w10-app/terraform/`).
-- **GitOps:** ArgoCD App-of-Apps. AppProject `w10-lab`, repo `pho-veteran/w10-gitops`,
-  sync theo wave, `automated: {prune, selfHeal}`.
-- **Workload `web`:** Node.js/Express ở namespace `demo`, port 3000, probe `/api/health`,
-  chạy bằng Argo Rollout (canary), image `vihn/w10-web`.
+### 1.1. ArgoCD / controller health
 
-> ⚠️ **Khác với tài liệu D1-D3:** các doc giả định `web` là `Deployment` `replicas: 1`
-> chưa hardening. Repo này dùng Argo Rollout (canary) và đã để `replicas: 2`, nên các bước
-> được chỉnh lại cho khớp: constraint min-replicas match `argoproj.io/Rollout`, còn
-> remediation áp vào `rollout.yaml`.
-
----
-
-## Kế hoạch theo ngày
-
-### ✅ D1: RBAC + Admission Policy (đã tích hợp)
-
-- **RBAC 3 persona** trong ns `demo` (`w10-gitops/platform/rbac/`, App `platform-rbac`):
-  - `developer`: CRUD workload, không có secrets/exec/delete-namespace.
-  - `sre`: toàn quyền trong ns (secrets, `pods/exec`, RBAC ns-scope), không có cluster-scope.
-  - `viewer`: read-only, bind ClusterRole `view`.
-- **OPA Gatekeeper** (Helm 3.21.0, App `gatekeeper`) cùng 4 constraint
-  (`w10-gitops/platform/gatekeeper/`, App `gatekeeper-policies`), khởi đầu ở `dryrun`:
-  `deny-privileged`, `require-requests-limits`, `require-run-as-nonroot`,
-  `require-min-2-replicas`.
-- **Remediate** rollout `web`: securityContext (runAsNonRoot, drop caps,
-  readOnlyRootFilesystem cùng `/tmp` emptyDir) và resource requests/limits.
-
-Nghiệm thu: `kubectl auth can-i --as=...` trả đúng ranh giới từng role; ở `dryrun` audit
-phát hiện vi phạm; remediate qua Git thì audit về 0; đổi `dryrun` sang `deny` thì manifest
-vi phạm bị chặn tại admission. Runbook chi tiết: [`w10-gitops/platform/README.md`](w10-gitops/platform/README.md).
-
-### 📋 D2: Secrets Rotation + Supply Chain (kế hoạch)
-
-- **ESO (External Secrets Operator)** đọc AWS Secrets Manager rồi ghi K8s Secret
-  `web-app-secret` trong `demo`, `refreshInterval: 30s`. Manifest dự kiến ở
-  `w10-gitops/platform/eso/` (SecretStore + ExternalSecret), kèm một App ArgoCD.
-- **Trivy gate** trong CI (`w10-app/.github/workflows/ci.yml`): fail-on `HIGH,CRITICAL`;
-  mỗi ngoại lệ trong `.trivyignore` ghi rõ lý do và ngày hết hạn (ADR có thời hạn). Bonus: secrets scan.
-- **Cosign keyless** (OIDC GitHub Actions) ký image theo digest và ghi vào Rekor.
-- **Kyverno `verifyImages`** (`w10-gitops/platform/kyverno/`): chạy `Audit` trước rồi
-  `Enforce`, từ chối image chưa ký trong `demo`.
-
-Nghiệm thu: secret rotate dưới 60s mà không sửa Git; trình bày được tradeoff giữa env và
-mounted volume (no-restart); CI fail khi có CVE HIGH/CRITICAL; image ký keyless có bản ghi
-Rekor; admission ở `Enforce` từ chối image chưa ký.
-
-### 📋 D3: Platform Integration + Operations (kế hoạch)
-
-- **ResourceQuota + LimitRange** cho ns `demo`, và nâng `web` lên QoS Guaranteed
-  (requests bằng limits). Manifest dự kiến ở `w10-gitops/platform/quotas/`, App
-  `platform-quotas` (sync-wave 1).
-- **NetworkPolicy** `default-deny-ingress` cùng `allow-web` (cần `minikube start --cni=calico`).
-- **Chaos test** pod-delete để kiểm chứng self-heal của ArgoCD (tùy chọn Litmus).
-- **Runbook** sự cố `docs/runbooks/web-pod-compromise.md`, 8 mục từ Trigger đến Post-mortem.
-- **Cost Guard** (Terraform `w10-app/terraform/modules/cost-guard/`): SNS cùng AWS Cost
-  Anomaly Detection, ngưỡng $50/ngày, gửi email.
-
-Nghiệm thu: pod `web` ở `QoS Class: Guaranteed`; deploy vượt trần bị `exceeded quota`;
-NetworkPolicy chặn đúng luồng; xóa pod thì self-heal giữ Healthy (replicas=2 nên không
-downtime); runbook đủ mục; Cost Guard active.
-
-### 📋 Lab tổng hợp (T5-T6)
-
-Lab "6-risk cluster cleanup + cluster-level enforcement": quét sạch vi phạm và bật
-enforcement toàn cluster. Chốt bằng bài kiểm tra mini platform end-to-end dưới 2h: từ fresh
-cluster, chạy `infra:apply` rồi `gitops:bootstrap`, đến khi `web` Synced/Healthy với mọi
-policy D1+D2+D3 bật đúng thứ tự wave (namespace, project, platform, web).
-
----
-
-## Cấu trúc thư mục
-
-```text
-w10-lab/
-├── w10-app/                      # App Node.js/Express + Terraform (infra + bootstrap)
-│   ├── app/                      #   source app + Dockerfile (USER node, non-root)
-│   ├── bootstrap/terraform/      #   GitHub OIDC + IAM role + S3 state backend
-│   ├── terraform/                #   network / security / ec2 / alb  (cost-guard thêm ở D3)
-│   ├── .github/workflows/ci.yml  #   CI (Trivy + Cosign thêm ở D2)
-│   └── task.sh
-└── w10-gitops/                   # Source of truth cho ArgoCD (App-of-Apps)
-    ├── apps/
-    │   ├── root.yaml             #   root Application
-    │   └── children/             #   namespace, project, rbac, gatekeeper, web, monitoring…
-    ├── platform/                 # Cluster guardrails
-    │   ├── rbac/                 #   ✅ D1: 3 persona
-    │   ├── gatekeeper/           #   ✅ D1: ConstraintTemplates + Constraints
-    │   ├── eso/                  #   📋 D2: External Secrets
-    │   ├── kyverno/              #   📋 D2: verifyImages
-    │   └── quotas/               #   📋 D3: Quota/LimitRange/NetworkPolicy
-    └── workloads/
-        ├── web/                  #   Argo Rollout (canary) + services
-        └── web-monitoring/       #   ServiceMonitor + PrometheusRule + Grafana
+```bash
+kubectl get applications -n argocd
+kubectl get pods -n gatekeeper-system
 ```
 
-### `task.sh` (wrapper gọi `w10-app/task.sh`)
+![ArgoCD / controller health](assets/rbac-argocd.png)
 
-`bootstrap:validate` · `bootstrap:apply` · `infra:apply` · `infra:destroy` ·
-`infra:fmt` · `infra:validate` · `output` · `ssh` · `ssm` ·
-`gitops:bootstrap` · `gitops:status` · `gitops:sync` · `argocd:port-forward`
+### 1.2. RBAC impersonation
+
+```bash
+kubectl auth can-i create deployments --as=alice -n demo
+kubectl auth can-i get secrets --as=alice -n demo
+kubectl auth can-i get secrets --as=bob -n demo
+kubectl auth can-i create deployments --as=carol -n demo
+```
+
+![RBAC impersonation](assets/rbac-can-i.png)
+
+### 1.3. Gatekeeper constraints
+
+```bash
+kubectl get constrainttemplates
+kubectl get k8sdisallowedtags
+kubectl get k8srequiredresources
+kubectl get k8spspallowedusers
+kubectl get k8spsphostnetworkingports
+kubectl get k8smaxdeploymentreplicas
+kubectl get k8smaxdeploymentreplicas max-deployment-replicas -o yaml
+```
+
+![Gatekeeper constraints](assets/gatekeeper-constraints.png)
+
+### 1.4. 4 case bị reject
+
+```bash
+kubectl apply -f w10-gitops-repo/evidence/day-a/bad-latest.yaml
+kubectl apply -f w10-gitops-repo/evidence/day-a/bad-no-limits.yaml
+kubectl apply -f w10-gitops-repo/evidence/day-a/bad-root.yaml
+kubectl apply -f w10-gitops-repo/evidence/day-a/bad-hostnetwork.yaml
+```
+
+![4 Reject cases ](assets/reject-cases.png)
+
+#### `w10-gitops/evidence/day-a/bad-latest.yaml`
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-latest
+  namespace: demo
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: bad-latest
+      image: nginx:latest
+      command: ["sh", "-c", "sleep 3600"]
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+```
+
+#### `w10-gitops/evidence/day-a/bad-no-limits.yaml`
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-no-limits
+  namespace: demo
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: bad-no-limits
+      image: nginx:1.27.0
+      command: ["sh", "-c", "sleep 3600"]
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+```
+
+#### `w10-gitops/evidence/day-a/bad-root.yaml`
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-root
+  namespace: demo
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsUser: 0
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: bad-root
+      image: nginx:1.27.0
+      command: ["sh", "-c", "sleep 3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+```
+
+#### `w10-gitops/evidence/day-a/bad-hostnetwork.yaml`
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-hostnetwork
+  namespace: demo
+spec:
+  hostNetwork: true
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: bad-hostnetwork
+      image: nginx:1.27.0
+      command: ["sh", "-c", "sleep 3600"]
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+```
+
+### 1.5. 1 manifest hợp lệ pass
+
+```bash
+kubectl apply -f w10-gitops-repo/evidence/day-a/good-pod.yaml
+kubectl get pod -n demo
+```
+
+![Valid manifest pass](assets/valid-manifest-pass.png)
+
+#### `w10-gitops/evidence/day-a/good-pod.yaml`
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: good-pod
+  namespace: demo
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: good-pod
+      image: nginx:1.27.0
+      command: ["sh", "-c", "sleep 3600"]
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+```
+
+### 1.6. Custom policy fail / pass
+
+```bash
+kubectl apply -f w10-gitops-repo/evidence/day-a/deployment-replicas-6.yaml
+kubectl apply -f w10-gitops-repo/evidence/day-a/deployment-replicas-3.yaml
+```
+
+![Max replicas fail/pass](assets/max-replicas-fail-pass.png)
+
+#### `w10-gitops/evidence/day-a/deployment-replicas-6.yaml`
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: max-replicas-6
+  namespace: demo
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: max-replicas-6
+  template:
+    metadata:
+      labels:
+        app: max-replicas-6
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          image: nginx:1.27.0
+          command: ["sh", "-c", "sleep 3600"]
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+```
+
+#### `w10-gitops/evidence/day-a/deployment-replicas-3.yaml`
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: max-replicas-3
+  namespace: demo
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: max-replicas-3
+  template:
+    metadata:
+      labels:
+        app: max-replicas-3
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          image: nginx:1.27.0
+          command: ["sh", "-c", "sleep 3600"]
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+```
 
 ---
 
-## Tài liệu nguồn
+## 2. External Secrets + Supply Chain
 
-- **Yêu cầu tuần:** `xbrain-learners/W10/W10_phase2_announcement_cloud.md`
-- **D1:** `cloud/w10/w10-d1-rbac-admission-doc.html` (RBAC + Admission)
-- **D2:** `cloud/w10/w10-d2-secrets-supplychain-doc.html` (Secrets + Supply Chain)
-- **D3:** `cloud/w10/w10-d3-platform-operations-doc.html` (Platform + Cost Guard)
+### 2.1. Controller health
 
-Tham khảo chính thống: [Kubernetes RBAC](https://kubernetes.io/docs/reference/access-authn-authz/rbac) ·
-[OPA Gatekeeper](https://open-policy-agent.github.io/gatekeeper) ·
-[External Secrets Operator](https://external-secrets.io/latest) ·
-[Trivy](https://aquasecurity.github.io/trivy) ·
-[Cosign / Sigstore](https://docs.sigstore.dev/cosign/overview) ·
-[Kyverno](https://kyverno.io/docs) ·
-[ResourceQuota](https://kubernetes.io/docs/concepts/policy/resource-quotas) ·
-[AWS Cost Anomaly Detection](https://docs.aws.amazon.com/cost-management/latest/userguide/manage-ad.html)
+```bash
+kubectl get pods -n external-secrets
+kubectl get pods -n cosign-system
+```
+
+![External Secrets and Sigstore health](assets/es-cs-health.png)
+
+### 2.2. ExternalSecret ready
+
+```bash
+kubectl get secretstore,externalsecret -n demo
+kubectl describe externalsecret web-db-secret -n demo
+```
+
+![ExternalSecret ready](assets/externalsecret-ready.png)
+
+### 2.3. Rotate secret
+
+#### Trước khi rotate
+
+```bash
+date -u +"%Y-%m-%dT%H:%M:%SZ"
+kubectl get secret web-db-secret -n demo -o jsonpath='{.data.host}' | base64 -d && echo
+pod=$(kubectl get pod -n demo -l app.kubernetes.io/name=web -o jsonpath='{.items[0].metadata.name}')
+kubectl get pod "$pod" -n demo -o jsonpath='{.status.containerStatuses[0].restartCount}' && echo
+curl -s http://localhost:30080/api/db/health
+```
+
+#### Rotate ở source
+
+```bash
+aws secretsmanager put-secret-value --secret-id arn:aws:secretsmanager:ap-southeast-1:193229476041:secret:p2-w10-lab-lab/rds-LnIe4O --secret-string '{"username":"postgres","password":"matkhaucuatao","host":"p2-w10-lab-lab-postgres.cry8o64cwzj7.ap-southeast-1.rds.amazonaws.com","port":5432,"dbname":"postgres"}'
+```
+
+### Trigger rotate 
+
+```bash
+kubectl annotate externalsecret web-db-secret -n demo force-sync=$(date +%s) --overwrite
+```
+
+#### Sau khi rotate
+
+```bash
+date -u +"%Y-%m-%dT%H:%M:%SZ"
+kubectl get secret web-db-secret -n demo -o jsonpath='{.data.host}' | base64 -d && echo
+kubectl get pod "$pod" -n demo -o jsonpath='{.status.containerStatuses[0].restartCount}' && echo
+curl -s http://localhost:30080/api/db/health
+```
+
+![Secret before rotation](assets/secret-before.png)
+![Secret rotate source](assets/secret-rotate-source.png)
+![Secret after rotation](assets/secret-after.png)
+
+### 2.4. Trivy fail proof
+
+![Trivy fail proof](assets/trivy-fail.png)
+
+### 2.5. Cosign sign / verify
+
+![Cosign sign](assets/cosign-sign.png)
+![Cosign verify](assets/cosign-verify.png)
+
+### 2.6. ClusterImagePolicy
+
+```bash
+kubectl get clusterimagepolicy require-signed-w10-web -o yaml
+```
+
+![ClusterImagePolicy](assets/clusterimagepolicy.png)
+
+### 2.7. Unsigned image bị chặn
+
+```bash
+kubectl -n payments run curl --image=curlimages/curl:8.10.1 --rm -it --restart=Never -- sh
+```
+
+![Unsigned image reject](assets/unsigned-image-reject.png)
+
+### 2.9. Signed workload pass
+
+```bash
+kubectl argo rollouts get rollout web -n demo
+kubectl get pods -n demo
+```
+
+![Signed workload pass](assets/signed-workload-pass.png)
+
+---
+
+## 3. Payments
+
+### 3.1. Tenant sync + labels
+
+```bash
+kubectl get applications -n argocd
+kubectl get ns payments --show-labels
+```
+![Payments ArgoCD](assets/payments-argocd.png)
+
+### 3.2. RBAC least-privilege
+
+```bash
+kubectl auth can-i create deployments -n payments --as=payments-dev
+kubectl auth can-i create deployments -n demo --as=payments-dev
+kubectl auth can-i get secrets -n payments --as=payments-dev
+kubectl auth can-i create rolebindings -n payments --as=payments-dev
+```
+
+![Payments RBAC](assets/payments-rbac.png)
+
+### 3.3. Quota reject
+
+```bash
+IMG=$(kubectl -n payments get deploy payments-api -o jsonpath='{.spec.template.spec.containers[0].image}')
+echo $IMG
+
+kubectl -n payments apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: payments-quota-reject-demo
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      image: $IMG
+      command: ["sh", "-c", "sleep 3600"]
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: "2"
+          memory: 2Gi
+        limits:
+          cpu: "2"
+          memory: 2Gi
+EOF
+```
+
+![Payments quota reject](assets/payments-quota-reject.png)
+
+### 3.4. LimitRange default inject
+
+```bash
+IMG=$(kubectl -n payments get deploy payments-api -o jsonpath='{.spec.template.spec.containers[0].image}')
+echo $IMG
+
+kubectl -n payments apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: payments-lr-default-demo
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      image: $IMG
+      command: ["sh", "-c", "sleep 3600"]
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+EOF
+
+kubectl -n payments get pod payments-lr-default-demo -o jsonpath='{.spec.containers[0].resources}'
+kubectl -n payments delete pod payments-lr-default-demo
+```
+
+![Payments LimitRange defaults](assets/payments-limitrange-defaults.png)
+
+### 3.5. NetworkPolicy
+
+```bash
+IMG=$(kubectl -n payments get deploy payments-api -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+kubectl -n payments apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: netpol-debug
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: netpol-debug
+      image: $IMG
+      command: ["sh", "-c", "sleep 3600"]
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+EOF
+
+kubectl -n payments exec -it netpol-debug -- sh
+```
+
+Trong shell:
+
+```bash
+node -e "const http=require('http'); const req=http.get('http://web.demo.svc.cluster.local/api/health', r=>{console.log('STATUS',r.statusCode); r.resume();}); req.setTimeout(3000,()=>{console.log('TIMEOUT/BLOCKED'); req.destroy();}); req.on('error',e=>console.log('ERROR',e.code||e.message));"
+
+node -e "const http=require('http'); const req=http.get('http://payments-api.payments.svc.cluster.local/api/health', r=>{console.log('STATUS',r.statusCode); r.on('data',d=>process.stdout.write(d));}); req.setTimeout(3000,()=>{console.log('TIMEOUT'); req.destroy();}); req.on('error',e=>console.log('ERROR',e.code||e.message));"
+```
+
+![Payments NetworkPolicy demo](assets/payments-networkpolicy-demo.png)
+
+### 3.6. Constraint inherited
+
+```bash
+kubectl apply -f w10-gitops-repo/evidence/payments/bad-latest.yaml
+```
+
+![Payments inherited guardrail](assets/payments-inherited-guardrail.png)
+
+#### `w10-gitops/evidence/payments/bad-latest.yaml`
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-latest
+  namespace: payments
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: bad-latest
+      image: nginx:latest
+      command: ["sh", "-c", "sleep 3600"]
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+```
+
+### 3.7. App health
+
+```bash
+kubectl -n payments get deploy payments-api
+kubectl -n payments get pods
+kubectl -n payments get svc payments-api
+```
+
+![Payments app healthy](assets/payments-app-healthy.png)
+
+---
+
+## 4. Câu hỏi
+
+### 4.1. Vì sao guardrail cũ tự áp cho team B?
+
+Vì ngay từ đầu em không buộc constraint vào riêng namespace `demo` mà chọn theo label `app.kubernetes.io/part-of=p2-w10-lab`. Namespace `payments` cũng có đúng label đó, nên lúc team B được onboard thì bộ guardrail cũ tự áp vào, không cần viết thêm policy riêng cho `payments`.
+
+### 4.2. Role/RoleBinding khác ClusterRoleBinding thế nào?
+
+`Role` với `RoleBinding` chỉ có hiệu lực trong một namespace, nên em dùng cách này để giữ quyền của `payments-dev` nằm trong `payments`. Nghĩa là team đó deploy được trong namespace của họ, nhưng không đụng sang `demo` hay namespace khác. Còn `ClusterRoleBinding` thì phạm vi quyền rộng hơn. Nếu dùng không kỹ thì rất dễ làm mất tính cô lập giữa các tenants.

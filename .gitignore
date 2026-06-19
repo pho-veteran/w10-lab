@@ -8,3 +8,6 @@ crash.*.log
 .generated/
 w10-app/app/node_modules/
 w10-app/app/dist/
+.codegraph
+# CocoIndex Code (ccc)
+/.cocoindex_code/
