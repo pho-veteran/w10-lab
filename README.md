@@ -1,6 +1,9 @@
 # Evidence README
 
 ---
+## 0. Prerequisites: Overall health check
+
+![All healthy](assets/overall-healthy.png)
 
 ## 1. RBAC + Gatekeeper
 
