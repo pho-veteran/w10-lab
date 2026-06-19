@@ -1,6 +1,11 @@
 # Evidence README
 
 ---
+Link to Repositories
+- [App Repo](https://github.com/pho-veteran/w10-app)
+- [GitOps Repo](https://github.com/pho-veteran/w10-gitops)
+---
+
 ## 0. Prerequisites: Overall health check
 
 ![All healthy](assets/overall-healthy.png)
